@@ -1,3 +1,5 @@
+
+
 local DEFAULT_SETTINGS = {
 
 	TIME_VARIANCE = 0.07;
@@ -5,17 +7,11 @@ local DEFAULT_SETTINGS = {
 	COMPARISON_CHECKS = 1;
 
 	JUMP_WHEN_STUCK = true;
-
-	-- Khoảng cách (stud) tới waypoint hiện tại mà tại đó bắt đầu ra lệnh
-	-- MoveTo waypoint kế tiếp SỚM, thay vì đợi humanoid dừng hẳn rồi mới
-	-- reissue MoveTo. Đây là fix chính cho hiện tượng đi khựng từng waypoint.
-	WAYPOINT_LOOKAHEAD = 4;
 }
 
 ---------------------------------------------------------------------
 
 local PathfindingService = game:GetService("PathfindingService")
-local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local function output(func, msg)
 	func(((func == error and "SimplePath Error: ") or "SimplePath: ")..msg)
@@ -103,11 +99,7 @@ local function setJumpState(self)
 end
 
 --Primary move function
--- Track số lệnh MoveTo đã ra nhưng chưa xác nhận kết quả -- cần để
--- moveConnection biết bỏ qua các MoveToFinished "giả" (reached=false) do
--- bị look-ahead ghi đè, chỉ xử lý kết quả của lệnh MoveTo mới nhất.
 local function move(self)
-	self._pendingMoves = (self._pendingMoves or 0) + 1
 	if self._waypoints[self._currentWaypoint].Action == Enum.PathWaypointAction.Jump then
 		setJumpState(self)
 	end
@@ -120,14 +112,6 @@ local function disconnectMoveConnection(self)
 	self._moveConnection = nil
 end
 
---Disconnect look-ahead Heartbeat connection
-local function disconnectHeartbeatConnection(self)
-	if self._heartbeatConn then
-		self._heartbeatConn:Disconnect()
-		self._heartbeatConn = nil
-	end
-end
-
 --Fire the WaypointReached event
 local function invokeWaypointReached(self)
 	local lastWaypoint = self._waypoints[self._currentWaypoint - 1]
@@ -135,27 +119,8 @@ local function invokeWaypointReached(self)
 	self._events.WaypointReached:Fire(self._agent, lastWaypoint, nextWaypoint)
 end
 
---Chuyển sang waypoint kế tiếp SỚM, dựa trên khoảng cách, thay vì đợi
---MoveToFinished dừng hẳn. Không advance ở waypoint cuối cùng -- để
---MoveToFinished thật xử lý "Reached" cho chính xác.
-local function tryAdvanceEarly(self)
-	if self._status ~= Path.StatusType.Active or not self._humanoid then return end
-	if not self._currentWaypoint or self._currentWaypoint >= #self._waypoints then return end
-	local primary = self._agent.PrimaryPart
-	if not primary then return end
-
-	local dist = (primary.Position - self._waypoints[self._currentWaypoint].Position).Magnitude
-	if dist <= (self._settings.WAYPOINT_LOOKAHEAD or 4) then
-		if self._currentWaypoint + 1 < #self._waypoints then
-			invokeWaypointReached(self)
-		end
-		self._currentWaypoint += 1
-		move(self)
-	end
-end
-
 local function moveToFinished(self, reached)
-
+	
 	--Stop execution if Path is destroyed
 	if not getmetatable(self) then return end
 
@@ -184,13 +149,11 @@ local function moveToFinished(self, reached)
 		move(self)
 	elseif reached then --Target reached, pathfinding ends
 		disconnectMoveConnection(self)
-		disconnectHeartbeatConnection(self)
 		self._status = Path.StatusType.Idle
 		self._visualWaypoints = destroyVisualWaypoints(self._visualWaypoints)
 		self._events.Reached:Fire(self._agent, self._waypoints[self._currentWaypoint])
 	else --Target unreachable
 		disconnectMoveConnection(self)
-		disconnectHeartbeatConnection(self)
 		self._status = Path.StatusType.Idle
 		self._visualWaypoints = destroyVisualWaypoints(self._visualWaypoints)
 		declareError(self, self.ErrorType.TargetUnreachable)
@@ -241,7 +204,6 @@ function Path.new(agent, agentParameters, override)
 		_path = PathfindingService:CreatePath(agentParameters);
 		_status = "Idle";
 		_t = 0;
-		_pendingMoves = 0;
 		_position = {
 			_last = Vector3.new();
 			_count = 0;
@@ -274,7 +236,6 @@ function Path:Destroy()
 	if rawget(self, "_visualWaypoints") then
 		self._visualWaypoints = destroyVisualWaypoints(self._visualWaypoints)
 	end
-	disconnectHeartbeatConnection(self)
 	self._path:Destroy()
 	setmetatable(self, nil)
 	for k, _ in pairs(self) do
@@ -294,7 +255,6 @@ function Path:Stop()
 		return
 	end
 	disconnectMoveConnection(self)
-	disconnectHeartbeatConnection(self)
 	self._status = Path.StatusType.Idle
 	self._visualWaypoints = destroyVisualWaypoints(self._visualWaypoints)
 	self._events.Stopped:Fire(self._model)
@@ -341,7 +301,6 @@ function Path:Run(target)
 	--Set status to active; pathfinding starts
 	self._status = (self._humanoid and Path.StatusType.Active) or Path.StatusType.Idle
 	self._target = target
-	self._pendingMoves = 0
 
 	--Set network owner to server to prevent "hops"
 	pcall(function()
@@ -361,29 +320,14 @@ function Path:Run(target)
 	destroyVisualWaypoints(self._visualWaypoints)
 	self._visualWaypoints = (self.Visualize and createVisualWaypoints(self._waypoints))
 
-	--Create a new move connection if it doesn't exist already.
-	--Chỉ xử lý MoveToFinished khi đây là lệnh MoveTo MỚI NHẤT (pendingMoves
-	--về 0) -- các lệnh bị look-ahead ghi đè sẽ bắn reached=false trước đó,
-	--phải bỏ qua để không bị hiểu nhầm thành TargetUnreachable.
-	self._moveConnection = self._humanoid and (self._moveConnection or self._humanoid.MoveToFinished:Connect(function(reached)
-		self._pendingMoves = math.max((self._pendingMoves or 1) - 1, 0)
-		if self._pendingMoves > 0 then
-			return
-		end
-		moveToFinished(self, reached)
+	--Create a new move connection if it doesn't exist already
+	self._moveConnection = self._humanoid and (self._moveConnection or self._humanoid.MoveToFinished:Connect(function(...)
+		moveToFinished(self, ...)
 	end))
-
-	--Look-ahead: chuyển waypoint sớm theo khoảng cách để không bị khựng
-	--từng điểm. Chỉ chạy khi có humanoid.
-	if self._humanoid then
-		self._heartbeatConn = self._heartbeatConn or RunService.Heartbeat:Connect(function()
-			tryAdvanceEarly(self)
-		end)
-	end
 
 	--Begin pathfinding
 	if self._humanoid then
-		move(self)
+		self._humanoid:MoveTo(self._waypoints[self._currentWaypoint].Position)
 	elseif #self._waypoints == 2 then
 		self._target = nil
 		self._visualWaypoints = destroyVisualWaypoints(self._visualWaypoints)
